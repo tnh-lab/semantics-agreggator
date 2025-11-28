@@ -5,7 +5,8 @@ from typing import List, Dict, Tuple
 import numpy as np
 import pandas as pd
 import chromadb
-from sentence_transformers import SentenceTransformer
+import fasttext
+import fasttext.util
 import matplotlib.pyplot as plt
 import umap
 from adjustText import adjust_text
@@ -29,7 +30,6 @@ class Config:
     EXCEL_FILE_PATH: str = os.path.join(_BASE_DIR, FILE_NAME+".xlsx")
     CHROMA_DB_PATH: str = os.path.join(_BASE_DIR, "chroma_db")
     COLLECTION_NAME: str = "word_vectors"
-    MODEL_NAME: str = 'all-MiniLM-L6-v2'
 
 class SemanticComparer:
     """
@@ -41,7 +41,19 @@ class SemanticComparer:
         Initializes the SemanticComparer with a configuration.
         """
         self.config = config
-        self.model = SentenceTransformer(self.config.MODEL_NAME)
+        self.distance_logs = []
+        
+        # fastText model handling
+        model_path = 'cc.en.300.bin'
+        if not os.path.exists(model_path):
+            logging.info(f"fastText model '{model_path}' not found. Downloading...")
+            fasttext.util.download_model('en', if_exists='ignore')
+            logging.info("Download complete.")
+        
+        logging.info("Loading fastText model...")
+        self.model = fasttext.load_model(model_path)
+        logging.info("fastText model loaded.")
+
         self.client = chromadb.PersistentClient(path=self.config.CHROMA_DB_PATH)
         self.collection = self._get_or_create_collection()
         logging.info(f"ChromaDB persistent storage path: {os.path.abspath(self.config.CHROMA_DB_PATH)}")
@@ -65,7 +77,7 @@ class SemanticComparer:
         Encodes a word to a vector and adds it to the ChromaDB collection.
         """
         try:
-            embedding = self.model.encode(word).tolist()
+            embedding = self.model.get_word_vector(word).tolist()
             # ID must be unique. Using core_word and context for uniqueness.
             clean_id = f"{metadata.get('core_word', '')}_{metadata.get('context', '')}_{word}".lower().replace(" ", "_").replace(",", "")
             self.collection.add(
@@ -150,10 +162,68 @@ class SemanticComparer:
         if mean_vec_familiar.size > 0 and mean_vec_unfamiliar.size > 0:
             distance = self.calculate_euclidean_distance(mean_vec_familiar, mean_vec_unfamiliar)
             logging.info(f"Euclidean distance between mean vectors of 'familiar' and 'unfamiliar' for '{core_word}': {distance:.4f}")
+            
+            self.distance_logs.append({'core_word': core_word, 'distance': distance})
+            
             return distance
         else:
             logging.warning(f"Could not calculate distance for '{core_word}'; one or both context sets are empty.")
             return None
+
+    def update_distance_log_with_new_run(self):
+        log_file = 'distance_log.xlsx'
+        
+        if not self.distance_logs:
+            logging.warning("No new distances to log for this run.")
+            return
+
+        current_run_df = pd.DataFrame(self.distance_logs)
+        current_run_df = current_run_df.set_index('core_word')
+
+        timestamp_col = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+        current_run_df = current_run_df.rename(columns={'distance': timestamp_col})
+        
+        try:
+            if os.path.exists(log_file):
+                log_df = pd.read_excel(log_file, index_col=0)
+                updated_df = log_df.merge(current_run_df, on='core_word', how='outer')
+            else:
+                updated_df = current_run_df
+
+            updated_df.to_excel(log_file)
+            logging.info(f"Updated '{log_file}' with new run data in column '{timestamp_col}'.")
+
+        except Exception as e:
+            logging.error(f"Failed to update distance log: {e}")
+
+    def visualize_distance_scatterplot(self, output_filename: str):
+        log_file = 'distance_log.xlsx'
+        if not os.path.exists(log_file):
+            logging.warning(f"Distance log file '{log_file}' not found. Cannot generate scatter plot.")
+            return
+
+        try:
+            df = pd.read_excel(log_file, index_col=0)
+            
+            df['mean_distance'] = df.mean(axis=1)
+            df = df.reset_index()
+
+            fig, ax = plt.subplots(figsize=(16, 10))
+            
+            ax.scatter(df['core_word'], df['mean_distance'], color='purple', marker='x')
+            
+            ax.set_title("Mean of Euclidean Distances per Core Word (All Runs)")
+            ax.set_xlabel("Core Word")
+            ax.set_ylabel("Mean Euclidean Distance")
+            plt.xticks(rotation=45)
+            ax.grid(True)
+            plt.tight_layout()
+
+            plt.savefig(output_filename)
+            plt.close()
+            logging.info(f"Mean distance scatter plot saved to '{output_filename}'")
+        except Exception as e:
+            logging.error(f"Failed to generate distance scatter plot: {e}")
 
     def visualize_multiple(self, core_words: List[str], output_filename: str):
         """
@@ -173,15 +243,11 @@ class SemanticComparer:
         # Dictionary to map core_word -> colors
         core_word_color_map = {}
         for i, word in enumerate(core_words):
-            base_color = np.array(core_word_base_colors(i % core_word_base_colors.N))
-            pale_color = base_color.copy()
-            pale_color[:3] = pale_color[:3] + (1 - pale_color[:3]) * 0.6  # Mix with white
-            
-            core_word_color_map[word] = {'familiar': base_color, 'unfamiliar': pale_color}
+            core_word_color_map[word] = core_word_base_colors(i % core_word_base_colors.N)
 
         # 1. Gather all data points
         for core_word in core_words:
-            core_embedding = self.model.encode(core_word).tolist()
+            core_embedding = self.model.get_word_vector(core_word).tolist()
             plot_embeddings.append(core_embedding)
             plot_metadatas.append({'word': core_word, 'type': 'core_word', 'core_word': core_word})
 
@@ -212,31 +278,26 @@ class SemanticComparer:
             word_text = meta.get('word')
 
             color = 'gray'
-            edge_color = 'none' # No border by default
-            linewidth = 0 # No linewidth by default
-            
+            edge_color = 'black'
+            linewidth = 1.5
+            marker = 'o'
+
             if current_core_word:
+                color = core_word_color_map.get(current_core_word, 'gray')
                 if word_type == 'core_word':
-                    color = core_word_color_map[current_core_word]['familiar']
-                    edge_color = 'black'
-                    linewidth = 2.5 # Thicker border for core words
-                elif context_type == 'familiar':
-                    color = core_word_color_map[current_core_word]['familiar']
-                    edge_color = 'black'
-                    linewidth = 1.5 # Thicker border for familiar related words
+                    marker = '*'
+                    linewidth = 2.5
                 elif context_type == 'unfamiliar':
-                    color = core_word_color_map[current_core_word]['unfamiliar']
-
-
+                    marker = 's'
+            
+            size = 100
             if word_type == 'core_word':
-                ax.scatter(x, y, color=color, marker='*', s=500, alpha=1.0, 
-                           edgecolor=edge_color, zorder=10, linewidths=linewidth)
-                texts.append(ax.text(x, y, word_text, fontsize=10, weight='bold'))
-            elif word_type == 'related_word':
-                marker = 'o'
-                ax.scatter(x, y, color=color, marker=marker, s=100, alpha=0.8,
-                           edgecolor=edge_color, linewidths=linewidth)
-                texts.append(ax.text(x, y, word_text, fontsize=9))
+                size = 500
+
+            ax.scatter(x, y, color=color, marker=marker, s=size, alpha=0.8,
+                       edgecolor=edge_color, linewidths=linewidth, zorder=10 if word_type == 'core_word' else 5)
+            texts.append(ax.text(x, y, word_text, fontsize=9))
+
 
         adjust_text(texts, ax=ax, arrowprops=dict(arrowstyle="-", color='gray', lw=0.5))
 
@@ -250,12 +311,12 @@ class SemanticComparer:
         legend_elements = [
             Line2D([0], [0], marker='*', color='gray', label='Core Word', markersize=15, linestyle='None', markeredgecolor='black', markeredgewidth=2.5),
             Line2D([0], [0], marker='o', color='gray', label='Related (Familiar)', markersize=10, linestyle='None', markeredgecolor='black', markeredgewidth=1.5),
-            Line2D([0], [0], marker='o', color='lightgray', label='Related (Unfamiliar)', markersize=10, linestyle='None', markeredgecolor='none')
+            Line2D([0], [0], marker='s', color='gray', label='Related (Unfamiliar)', markersize=10, linestyle='None', markeredgecolor='black', markeredgewidth=1.5)
         ]
 
         # Add color entries to legend
-        for word, colors in core_word_color_map.items():
-             legend_elements.append(Line2D([0], [0], marker='s', color=colors['familiar'], 
+        for word, color in core_word_color_map.items():
+             legend_elements.append(Line2D([0], [0], marker='s', color=color, 
                                           label=f'{word.title()}', markersize=10, linestyle='None'))
 
         ax.legend(handles=legend_elements, title="Point Types and Core Words", loc='upper right', fontsize=10, title_fontsize='12')
@@ -264,6 +325,189 @@ class SemanticComparer:
         plt.savefig(output_filename)
         plt.close()
         logging.info(f"Combined visualization saved to '{output_filename}'")
+
+
+    def visualize_graph(self, core_word: str, output_filename: str):
+        """
+        Generates a graph visualization for a single core word and its contexts.
+        """
+        logging.info(f"--- Generating graph visualization for core word: '{core_word}' ---")
+
+        plot_embeddings = []
+        plot_metadatas = []
+
+        # 1. Gather data
+        core_embedding = self.model.get_word_vector(core_word).tolist()
+        plot_embeddings.append(core_embedding)
+        plot_metadatas.append({'word': core_word, 'type': 'core_word', 'core_word': core_word})
+
+        related_results = self.collection.get(where={"core_word": core_word}, include=['embeddings', 'metadatas'])
+        if related_results and related_results['ids']:
+            plot_embeddings.extend(related_results['embeddings'])
+            plot_metadatas.extend(related_results['metadatas'])
+        
+        if len(plot_embeddings) < 2:
+            logging.warning(f"Not enough data points for '{core_word}' to create a graph visualization.")
+            return
+
+        embeddings_np = np.array(plot_embeddings)
+        
+        # 2. UMAP reduction
+        reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=min(15, len(embeddings_np)-1))
+        reduced_embeddings = reducer.fit_transform(embeddings_np)
+        
+        # 3. Plot the data
+        fig, ax = plt.subplots(figsize=(16, 12))
+        
+        core_word_coords = reduced_embeddings[0]
+        
+        color_map = {'familiar': 'blue', 'unfamiliar': 'green'}
+        core_word_color = 'red'
+
+        texts = []
+        for i, (x, y) in enumerate(reduced_embeddings):
+            meta = plot_metadatas[i]
+            word_type = meta.get('type')
+            context_type = meta.get('context')
+            word_text = meta.get('word')
+
+            color = 'gray'
+            if word_type == 'core_word':
+                color = core_word_color
+                ax.scatter(x, y, color=color, marker='*', s=600, alpha=1.0, zorder=10, edgecolor='black', linewidths=2.5)
+                texts.append(ax.text(x, y, word_text, fontsize=12, weight='bold'))
+            else: # related_word
+                color = color_map.get(context_type, 'gray')
+                ax.scatter(x, y, color=color, marker='o', s=150, alpha=0.8, edgecolor='black', linewidths=1.0)
+                texts.append(ax.text(x, y, word_text, fontsize=9))
+                # Draw line to core word
+                ax.plot([core_word_coords[0], x], [core_word_coords[1], y], color='gray', linestyle='--', linewidth=0.7, zorder=1)
+
+    
+        adjust_text(texts, ax=ax, arrowprops=dict(arrowstyle="-", color='gray', lw=0.5))
+
+        ax.set_title(f"Example of Semantic Representation of the Word {core_word.title()}", fontsize=18)
+        ax.set_xlabel("UMAP Dimension 1", fontsize=12)
+        ax.set_ylabel("UMAP Dimension 2", fontsize=12)
+        ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+
+        # Custom legend
+        from matplotlib.lines import Line2D
+        legend_elements = [
+            Line2D([0], [0], marker='*', color=core_word_color, label='Core Word', markersize=15, linestyle='None', markeredgecolor='black'),
+            Line2D([0], [0], marker='o', color=color_map['familiar'], label='Related (Familiar)', markersize=10, linestyle='None', markeredgecolor='black'),
+            Line2D([0], [0], marker='o', color=color_map['unfamiliar'], label='Related (Unfamiliar)', markersize=10, linestyle='None', markeredgecolor='black')
+        ]
+        ax.legend(handles=legend_elements, title="Node Types", loc='upper right')
+
+        plt.tight_layout()
+        plt.savefig(output_filename)
+        plt.close()
+        logging.info(f"Graph visualization for '{core_word}' saved to '{output_filename}'")
+
+
+    def visualize_multiple_graph(self, core_words: List[str], output_filename: str):
+        """
+        Generates a combined UMAP graph visualization for multiple core words and their contexts.
+        """
+        logging.info(f"--- Generating combined graph visualization for core words: {core_words} ---")
+
+        plot_embeddings = []
+        plot_metadatas = []
+
+        # Color palette for core words
+        core_word_base_colors = plt.get_cmap('tab10')
+        if len(core_words) > 10:
+            logging.warning("More than 10 core words; colors will start to repeat.")
+            core_word_base_colors = plt.get_cmap('tab20')
+        
+        core_word_color_map = {word: core_word_base_colors(i % core_word_base_colors.N) for i, word in enumerate(core_words)}
+
+        # 1. Gather all data points
+        for core_word in core_words:
+            core_embedding = self.model.get_word_vector(core_word).tolist()
+            plot_embeddings.append(core_embedding)
+            plot_metadatas.append({'word': core_word, 'type': 'core_word', 'core_word': core_word})
+
+            related_results = self.collection.get(where={"core_word": core_word}, include=['embeddings', 'metadatas'])
+            if related_results['ids']:
+                plot_embeddings.extend(related_results['embeddings'])
+                plot_metadatas.extend(related_results['metadatas'])
+            
+        if len(plot_embeddings) < 2:
+            logging.warning("Not enough data points to create a visualization.")
+            return
+
+        embeddings_np = np.array(plot_embeddings)
+        
+        # 2. UMAP reduction
+        reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=min(15, len(embeddings_np)-1))
+        reduced_embeddings = reducer.fit_transform(embeddings_np)
+        
+        # 3. Plot the data
+        fig, ax = plt.subplots(figsize=(16, 12))
+
+        # Store core word coordinates
+        core_word_coords = {meta.get('word'): reduced_embeddings[i] for i, meta in enumerate(plot_metadatas) if meta.get('type') == 'core_word'}
+        
+        texts = []
+        for i, (x, y) in enumerate(reduced_embeddings):
+            meta = plot_metadatas[i]
+            word_type = meta.get('type')
+            context_type = meta.get('context')
+            current_core_word = meta.get('core_word')
+            word_text = meta.get('word')
+
+            color = 'gray'
+            edge_color = 'black'
+            linewidth = 1.5
+            marker = 'o'
+
+            if current_core_word:
+                color = core_word_color_map.get(current_core_word, 'gray')
+                if word_type == 'core_word':
+                    marker = '*'
+                    linewidth = 2.5
+                elif context_type == 'unfamiliar':
+                    marker = 's'
+            
+            size = 100
+            if word_type == 'core_word':
+                size = 500
+
+            ax.scatter(x, y, color=color, marker=marker, s=size, alpha=0.8,
+                       edgecolor=edge_color, linewidths=linewidth, zorder=10 if word_type == 'core_word' else 5)
+            texts.append(ax.text(x, y, word_text, fontsize=9))
+
+            # Draw line to core word
+            if word_type == 'related_word' and current_core_word in core_word_coords:
+                core_coords = core_word_coords[current_core_word]
+                ax.plot([core_coords[0], x], [core_coords[1], y], color=color, linestyle='--', linewidth=0.7, zorder=1)
+
+        adjust_text(texts, ax=ax, arrowprops=dict(arrowstyle="-", color='gray', lw=0.5))
+
+        ax.set_title(f"Semantic Network Representation of Displayed Words", fontsize=18)
+        ax.set_xlabel("UMAP Dimension 1", fontsize=12)
+        ax.set_ylabel("UMAP Dimension 2", fontsize=12)
+        ax.grid(True, which='both', linestyle='--', linewidth=0.5)
+
+        # Create custom legend
+        from matplotlib.lines import Line2D
+        legend_elements = [
+            Line2D([0], [0], marker='*', color='gray', label='Core Word', markersize=15, linestyle='None', markeredgecolor='black', markeredgewidth=2.5),
+            Line2D([0], [0], marker='o', color='gray', label='Related (Familiar)', markersize=10, linestyle='None', markeredgecolor='black', markeredgewidth=1.5),
+            Line2D([0], [0], marker='s', color='gray', label='Related (Unfamiliar)', markersize=10, linestyle='None', markeredgecolor='black', markeredgewidth=1.5)
+        ]
+
+        for word, color in core_word_color_map.items():
+             legend_elements.append(Line2D([0], [0], marker='s', color=color, label=f'{word.title()}', markersize=10, linestyle='None'))
+
+        ax.legend(handles=legend_elements, title="Point Types and Core Words", loc='upper right', fontsize=10, title_fontsize='12')
+        
+        plt.tight_layout()
+        plt.savefig(output_filename)
+        plt.close()
+        logging.info(f"Combined graph visualization saved to '{output_filename}'")
 
 
 def main():
@@ -281,9 +525,16 @@ def main():
     # Analyze each core word
     for word in core_words_to_analyze:
         comparer.analyze_and_compare(word)
+        
+    # Update and visualize distances
+    comparer.update_distance_log_with_new_run()
+    comparer.visualize_distance_scatterplot(config.FILE_NAME+"_distance_scatterplot.png")
     
-    # Generate a combined visualization for all specified core words
+    # Other visualizations
     comparer.visualize_multiple(core_words_to_analyze, config.FILE_NAME+"_semantic_clusters.png")
+    comparer.visualize_graph("hanger", "hanger_graph.png")
+    comparer.visualize_multiple_graph(core_words_to_analyze, config.FILE_NAME+"_semantic_graph_clusters.png")
+
 
 if __name__ == "__main__":
     main()
