@@ -1,0 +1,9 @@
+sentence-transformers
+numpy
+matplotlib
+python-dotenv
+chromadb
+pandas
+openpyxl
+umap-learn
+adjustText
